@@ -12,17 +12,16 @@
 mod context;
 mod switch;
 #[allow(clippy::module_inception)]
-mod task;
-
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
+pub mod task;
+use crate::syscall::process::TaskInfo;
+use crate::timer::get_time_ms;
 pub use context::TaskContext;
-
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -54,6 +53,9 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            running: false,
+            syscall_times: [0; 500],
+            start_time: 0,
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -71,6 +73,10 @@ lazy_static! {
     };
 }
 
+pub fn syscall_inc(id: usize) {
+    TASK_MANAGER.syscall_inc(id);
+}
+
 impl TaskManager {
     /// Run the first task in task list.
     ///
@@ -80,6 +86,10 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
+        if !task0.running {
+            task0.start_time = get_time_ms();
+            task0.running = true;
+        }
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -88,6 +98,30 @@ impl TaskManager {
             __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
         }
         panic!("unreachable in run_first_task!");
+    }
+
+    /// Add syscall counter
+    fn syscall_inc(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[id] += 1;
+    }
+
+    fn get_task_info(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let mut syscall_times = [0; 500];
+        for (i, &count) in inner.tasks[cur].syscall_times.iter().enumerate() {
+            syscall_times[i] = count as u32;
+        }
+        let status = TaskStatus::Running;
+        let time = get_time_ms() - inner.tasks[cur].start_time;
+
+        TaskInfo {
+            status,
+            time,
+            syscall_times,
+        }
     }
 
     /// Change the status of current `Running` task into `Ready`.
@@ -123,6 +157,11 @@ impl TaskManager {
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
+            let task = &mut inner.tasks[next];
+            if !task.running {
+                task.running = true;
+                task.start_time = get_time_ms();
+            }
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
@@ -135,6 +174,10 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+}
+
+pub fn get_task_info() -> TaskInfo {
+    TASK_MANAGER.get_task_info()
 }
 
 /// Run the first task in task list.
